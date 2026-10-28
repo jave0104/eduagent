@@ -1,0 +1,803 @@
+const undici = require('undici');
+const { ProxyAgent } = undici;
+const { API_KEYS, proxyUrl, EMBED_MODEL, CHAT_MODEL, DEEPSEEK_API_KEY, DEEPSEEK_API_URL, DEEPSEEK_CHAT_MODEL } = require('../config');
+const logger = require('./logger');
+const { logApiUsage } = require('./usage');
+
+const proxyAgent = proxyUrl ? new ProxyAgent(proxyUrl) : null;
+if (proxyAgent) logger.info(`[Proxy] Using ${proxyUrl} for API requests`);
+
+const maskKey = (key) => process.env.NODE_ENV === 'test' ? 'mock_gemini_key_***' : key.slice(0, 6) + '...';
+const keyLastUsed = new Map();
+
+function getNextKey() {
+  // Filter out permanently invalid keys
+  const activeKeys = API_KEYS.filter(k => !invalidKeys.has(k));
+  if (activeKeys.length === 0) return API_KEYS[0]; // fallback
+
+  const now = Date.now();
+  // Filter keys not in cooldown
+  const available = activeKeys.filter(k => {
+    const cd = keyCooldown.get(k);
+    return !cd || now > cd;
+  });
+
+  // Fall back to all active keys if all are in cooldown
+  const candidatePool = available.length > 0 ? available : activeKeys;
+
+  let selectedKey = candidatePool[0];
+  let oldestTime = keyLastUsed.get(selectedKey) || 0;
+
+  for (const k of candidatePool) {
+    const lastUsed = keyLastUsed.get(k) || 0;
+    if (lastUsed < oldestTime) {
+      oldestTime = lastUsed;
+      selectedKey = k;
+    }
+  }
+
+  keyLastUsed.set(selectedKey, now);
+  return selectedKey;
+}
+
+function buildEmbedURL(modelName) {
+  const m = (modelName && String(modelName).includes('embedding')) ? modelName : EMBED_MODEL;
+  return `https://generativelanguage.googleapis.com/v1beta/models/${m}:embedContent`;
+}
+
+function buildChatURL(modelName) {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
+}
+
+function buildStreamURL(modelName) {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse`;
+}
+
+// Key pool health and cooldown states
+const keyCooldown = new Map(); // key -> timestamp when cooldown ends
+const invalidKeys = new Set(); // permanently failed keys
+
+/**
+ * Perform active health check on all Gemini keys
+ */
+async function checkKeysHealth() {
+  logger.info('[HealthCheck] Starting Gemini API keys validation...');
+  for (const key of API_KEYS) {
+    try {
+      const modelToPing = CHAT_MODEL || 'gemini-2.5-flash';
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelToPing}:generateContent?key=${key}`;
+      const payload = {
+        contents: [{ parts: [{ text: 'ping' }] }],
+        generationConfig: { maxOutputTokens: 1 }
+      };
+      
+      const fetchOptions = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      };
+      if (proxyAgent) fetchOptions.dispatcher = proxyAgent;
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      fetchOptions.signal = controller.signal;
+
+      const res = await undici.fetch(url, fetchOptions);
+      clearTimeout(timeoutId);
+
+      if (res.status === 400 || res.status === 403) {
+        let errBody = '';
+        try { errBody = await res.text(); } catch {}
+        const isRealAuthError = /API_KEY_INVALID|API key not valid|CONSUMER_SUSPENDED|PERMISSION_DENIED/i.test(errBody);
+        if (isRealAuthError) {
+          logger.error(`[HealthCheck] Key ${maskKey(key)} is INVALID (status ${res.status}). Marking as disabled.`);
+          invalidKeys.add(key);
+          keyLastUsed.delete(key);
+          keyCooldown.delete(key);
+        } else {
+          logger.warn(`[HealthCheck] Key ${maskKey(key)} returned ${res.status} (${errBody.slice(0, 100)}), key remains enabled.`);
+        }
+      } else {
+        if (invalidKeys.has(key)) {
+          logger.info(`[HealthCheck] Key ${maskKey(key)} recovered. Re-enabling.`);
+          invalidKeys.delete(key);
+        }
+      }
+    } catch (err) {
+      logger.error(`[HealthCheck] Network check failed for key ${maskKey(key)}: ${err.message}`);
+    }
+  }
+  logger.info(`[HealthCheck] Completed. Active keys: ${API_KEYS.filter(k => !invalidKeys.has(k)).length}/${API_KEYS.length}`);
+}
+
+function startEmbeddingCheck() {
+  // Start active validation check every 10 minutes, and once on startup (delayed 5s)
+  setInterval(checkKeysHealth, 10 * 60 * 1000).unref();
+  setTimeout(checkKeysHealth, 5000).unref();
+}
+
+/**
+ * Helper to determine if a model supports OpenAI-compatible multimodal vision
+ */
+function isOpenAiVisionModel(modelName) {
+  if (!modelName) return false;
+  const m = String(modelName).toLowerCase();
+  return m.includes('vl') || m.includes('vision') || m.includes('glm-4v') || m.includes('step-1v') || m.includes('qwen-vl') || m.includes('qwen2.5-vl');
+}
+
+/**
+ * Convert Gemini payload structure to DeepSeek / OpenAI-compatible payload
+ */
+function convertGeminiToDeepSeekPayload(geminiPayload, isStream, modelName = null) {
+  const selectedModel = modelName && modelName !== 'default' ? modelName : (process.env.DEEPSEEK_CHAT_MODEL || DEEPSEEK_CHAT_MODEL || 'deepseek-chat');
+  const isVisionModel = isOpenAiVisionModel(selectedModel);
+
+  const contents = geminiPayload.contents || [];
+  let userMessageContent = '';
+  const imageParts = [];
+
+  if (contents.length > 0 && contents[0].parts) {
+    const textParts = contents[0].parts.filter(p => p.text).map(p => p.text);
+    userMessageContent = textParts.join('\n');
+    
+    for (const p of contents[0].parts) {
+      if (p.inline_data && p.inline_data.data) {
+        imageParts.push(p.inline_data);
+      }
+    }
+  }
+
+  const hasImage = imageParts.length > 0;
+  let messages = [];
+
+  if (hasImage && isVisionModel) {
+    // Standard OpenAI multimodal format (Qwen-VL, GLM-4V, SiliconFlow, DashScope)
+    const contentItems = [];
+    for (const img of imageParts) {
+      const mime = img.mime_type || 'image/jpeg';
+      contentItems.push({
+        type: 'image_url',
+        image_url: {
+          url: `data:${mime};base64,${img.data}`
+        }
+      });
+    }
+    contentItems.push({
+      type: 'text',
+      text: userMessageContent
+    });
+    messages = [
+      { role: 'user', content: contentItems }
+    ];
+  } else {
+    // Text-only mode
+    if (hasImage && !isVisionModel) {
+      userMessageContent += '\n(注意：备用大模型收到了图片描述提问，但由于运行在纯文本模型模式，无法直接看图，已基于上下文文本进行回答)';
+    }
+
+    const splitKey = '学生提问：\n';
+    const splitIdx = userMessageContent.indexOf(splitKey);
+    if (splitIdx !== -1) {
+      let systemPrompt = userMessageContent.substring(0, splitIdx).trim();
+      systemPrompt += '\n\n【极其重要：Mermaid 脑图渲染规范】\n当你在回答中需要绘制思维导图时，必须且只能使用 ```mermaid 代码块包裹（内部写标准的 mindmap 或 graph TD 语法，如 mindmap\n  root\n    ...），绝对不要使用 ```mindmap 或 ```mermaid-mindmap 等非标准的 Markdown 语言标签，以便客户端能够正常编译和渲染图表。';
+      const userPrompt = userMessageContent.substring(splitIdx + splitKey.length).trim();
+      messages = [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ];
+    } else {
+      messages = [
+        { role: 'user', content: userMessageContent }
+      ];
+    }
+  }
+  
+  const deepseekPayload = {
+    model: selectedModel,
+    messages: messages,
+    temperature: geminiPayload.generationConfig?.temperature ?? 0.2,
+    stream: isStream
+  };
+
+  if (selectedModel.includes('reasoner') || selectedModel.includes('r1')) {
+    deepseekPayload.thinking = {
+      type: "enabled"
+    };
+  }
+
+  if (geminiPayload.generationConfig?.responseMimeType === 'application/json') {
+    deepseekPayload.response_format = { type: "json_object" };
+  }
+
+  if (geminiPayload.generationConfig?.maxOutputTokens) {
+    deepseekPayload.max_tokens = geminiPayload.generationConfig.maxOutputTokens;
+  }
+
+  return deepseekPayload;
+}
+
+/**
+ * Translates DeepSeek SSE Stream chunks to Gemini format chunks in real-time
+ */
+async function* translateDeepSeekStream(originalBody) {
+  let buffer = '';
+  let isThinking = false;
+
+  function processDataLine(dataStr) {
+    if (dataStr === '[DONE]') {
+      return 'data: [DONE]\n\n';
+    }
+    try {
+      const parsed = JSON.parse(dataStr);
+      const delta = parsed.choices?.[0]?.delta;
+      const text = delta?.content;
+      const reasoning = delta?.reasoning_content;
+
+      let outputText = '';
+      if (reasoning !== undefined && reasoning !== null && reasoning !== '') {
+        if (!isThinking) {
+          isThinking = true;
+          outputText += '<think>';
+        }
+        outputText += reasoning;
+      } else if (text !== undefined && text !== null && text !== '') {
+        if (isThinking) {
+          isThinking = false;
+          outputText += '</think>\n\n';
+        }
+        outputText += text;
+      }
+
+      if (outputText !== '') {
+        const translated = {
+          candidates: [{
+            content: {
+              parts: [{ text: outputText }]
+            }
+          }]
+        };
+        return `data: ${JSON.stringify(translated)}\n\n`;
+      }
+    } catch (e) {
+      return 'data: ' + dataStr + '\n\n';
+    }
+    return null;
+  }
+
+  for await (const chunk of originalBody) {
+    const chunkStr = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8');
+    buffer += chunkStr;
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) {
+        yield line + '\n';
+        continue;
+      }
+      const dataStr = line.slice(6).trim();
+      const processed = processDataLine(dataStr);
+      if (processed) {
+        yield processed;
+      }
+    }
+  }
+
+  if (buffer && buffer.startsWith('data: ')) {
+    const dataStr = buffer.slice(6).trim();
+    const processed = processDataLine(dataStr);
+    if (processed) {
+      yield processed;
+    }
+  }
+
+  // Ensure unclosed thinking tag is closed before stream ends
+  if (isThinking) {
+    isThinking = false;
+    const closeTag = {
+      candidates: [{
+        content: {
+          parts: [{ text: '</think>\n\n' }]
+        }
+      }]
+    };
+    yield `data: ${JSON.stringify(closeTag)}\n\n`;
+  }
+}
+
+/**
+ * Direct request to DeepSeek API when Gemini is unavailable or explicitly requested
+ */
+async function fetchDeepSeek(urlType, originalOptions, modelName = null) {
+  const headers = originalOptions?.headers || {};
+  const selectedModel = modelName && modelName !== 'default' ? modelName : (process.env.DEEPSEEK_CHAT_MODEL || DEEPSEEK_CHAT_MODEL || 'deepseek-chat');
+
+  const sfKey = (headers['x-siliconflow-api-key'] || headers['X-Siliconflow-Api-Key'] || process.env.SILICONFLOW_API_KEY || '').trim();
+  const dsKey = (headers['x-dashscope-api-key'] || headers['X-Dashscope-Api-Key'] || process.env.DASHSCOPE_API_KEY || '').trim();
+  const zpKey = (headers['x-zhipu-api-key'] || headers['X-Zhipu-Api-Key'] || process.env.ZHIPU_API_KEY || '').trim();
+  const deepseekKey = (headers['x-deepseek-api-key'] || headers['X-DeepSeek-Api-Key'] || process.env.DEEPSEEK_API_KEY || DEEPSEEK_API_KEY || '').trim();
+  const customKey = (headers['x-openai-api-key'] || headers['X-Openai-Api-Key'] || process.env.OPENAI_API_KEY || '').trim();
+
+  let targetUrl = '';
+  let targetKey = '';
+  let providerName = 'DeepSeek';
+
+  const mLower = selectedModel.toLowerCase();
+  if (selectedModel.startsWith('Qwen/') || selectedModel.startsWith('Pro/') || (mLower.includes('qwen') && sfKey) || (sfKey && !dsKey && !deepseekKey)) {
+    providerName = 'SiliconFlow';
+    targetUrl = (headers['x-custom-api-url'] || process.env.SILICONFLOW_API_URL || 'https://api.siliconflow.cn/v1').replace(/\/+$/, '');
+    targetKey = sfKey || customKey || deepseekKey;
+  } else if (mLower.includes('dashscope') || (mLower.includes('qwen') && dsKey) || (dsKey && !sfKey && !deepseekKey)) {
+    providerName = 'DashScope';
+    targetUrl = (headers['x-custom-api-url'] || process.env.DASHSCOPE_API_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/+$/, '');
+    targetKey = dsKey || customKey;
+  } else if (mLower.includes('glm') || (zpKey && !sfKey && !dsKey && !deepseekKey)) {
+    providerName = 'Zhipu';
+    targetUrl = (headers['x-custom-api-url'] || process.env.ZHIPU_API_URL || 'https://open.bigmodel.cn/api/paas/v4').replace(/\/+$/, '');
+    targetKey = zpKey || customKey;
+  } else {
+    providerName = 'DeepSeek';
+    const clientUrl = (headers['x-deepseek-api-url'] || headers['X-DeepSeek-Api-Url'])?.trim();
+    targetUrl = (clientUrl || process.env.DEEPSEEK_API_URL || DEEPSEEK_API_URL || 'https://api.deepseek.com/v1').replace(/\/+$/, '');
+    targetKey = deepseekKey || customKey || sfKey;
+  }
+
+  if (!targetKey) {
+    throw new Error(`缺少 ${providerName} API Key，请在设置中配置有效密钥。`);
+  }
+
+  logger.info(`[Gateway] Routing request to ${providerName} (${selectedModel}) at ${targetUrl}...`);
+
+  const geminiPayload = JSON.parse(originalOptions.body);
+  const isStream = urlType === 'stream';
+  const deepseekPayload = convertGeminiToDeepSeekPayload(geminiPayload, isStream, selectedModel);
+
+  const url = `${targetUrl}/chat/completions`;
+  const fetchOptions = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Authorization': `Bearer ${targetKey}`
+    },
+    body: JSON.stringify(deepseekPayload)
+  };
+  // Domestic Chinese high-speed API — connect directly for minimal latency
+  if (proxyAgent && process.env.PROXY_DOMESTIC === 'true') {
+    fetchOptions.dispatcher = proxyAgent;
+  }
+
+  const response = await undici.fetch(url, fetchOptions);
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`${providerName} API failed: ${response.status} ${errorBody}`);
+  }
+
+  if (isStream) {
+    logger.info(`[Gateway] Connected to ${providerName} streaming API.`);
+    const translatedGenerator = translateDeepSeekStream(response.body);
+    return {
+      ok: true,
+      status: 200,
+      body: translatedGenerator,
+      headers: response.headers
+    };
+  } else {
+    const data = await response.json();
+    logger.info('[Gateway] Received non-streaming response from DeepSeek.');
+    const text = data.choices?.[0]?.message?.content || '';
+    
+    try {
+      logApiUsage(selectedModel, 'chat', geminiPayload.contents?.[0]?.parts?.[0]?.text || '', text, 'success');
+    } catch (err) {
+      logger.error('[API Usage Log Failed]', err);
+    }
+
+    const geminiMockData = {
+      candidates: [{
+        content: {
+          parts: [{ text }]
+        }
+      }],
+      fallback_provider: 'deepseek'
+    };
+
+    return {
+      ok: true,
+      status: 200,
+      json: async () => geminiMockData,
+      text: async () => JSON.stringify(geminiMockData),
+      headers: response.headers
+    };
+  }
+}
+
+/**
+ * Fetch with automatic key rotation and retry logic.
+ * Tracks per-key rate limit state and falls back to DeepSeek if pool is depleted.
+ */
+async function fetchWithKeyRotation(buildURL, options, maxRetries = 8, timeoutMs = 30000, modelName = null, skipDeepSeek = false) {
+  let rawModel = modelName && modelName !== 'default' ? modelName : CHAT_MODEL;
+  // Security Fix: strictly validate model name to prevent path injection
+  if (!/^[a-zA-Z0-9./_-]+$/.test(rawModel)) {
+    logger.warn(`Invalid model name format provided: ${rawModel}, falling back to default`);
+    rawModel = CHAT_MODEL;
+  }
+  // Canonical model aliases
+  if (rawModel === 'gemini' || rawModel === 'gemini-flash' || rawModel === 'gemini-2.5' || rawModel === 'gemini-3.6-flash') {
+    rawModel = 'gemini-2.5-flash';
+  }
+  if (rawModel === 'deepseek' || rawModel === 'deepseek-v3') {
+    rawModel = 'deepseek-chat';
+  }
+  // Remap deprecated Gemini models (e.g. 2.0-flash, 1.5-flash, 2.5-flash-lite) to modern configured model
+  if (rawModel.includes('gemini-2.0-flash') || rawModel.includes('gemini-1.5') || rawModel.includes('gemini-2.5-flash-lite')) {
+    rawModel = 'gemini-2.5-flash';
+  }
+  let currentModel = rawModel;
+
+  // Auto-detect image / multimodal parts
+  let hasImage = false;
+  try {
+    if (options && options.body) {
+      const parsedBody = typeof options.body === 'string' ? JSON.parse(options.body) : options.body;
+      if (parsedBody && Array.isArray(parsedBody.contents)) {
+        for (const content of parsedBody.contents) {
+          if (content.parts && content.parts.some(p => p.inline_data)) {
+            hasImage = true;
+            break;
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  // Auto-route: If payload contains an image, the model MUST have vision capability!
+  // If the current requested model is text-only (e.g. DeepSeek-V3, DeepSeek-R1),
+  // prioritize domestic high-performance vision models before falling back to Gemini.
+  if (hasImage && !isOpenAiVisionModel(currentModel)) {
+    const isGeminiVision = currentModel.toLowerCase().includes('gemini');
+    if (!isGeminiVision) {
+      const h = options?.headers || {};
+      const sfKey = (h['x-siliconflow-api-key'] || h['X-Siliconflow-Api-Key'] || process.env.SILICONFLOW_API_KEY || '').trim();
+      const dsKey = (h['x-dashscope-api-key'] || h['X-Dashscope-Api-Key'] || process.env.DASHSCOPE_API_KEY || '').trim();
+      const zpKey = (h['x-zhipu-api-key'] || h['X-Zhipu-Api-Key'] || process.env.ZHIPU_API_KEY || '').trim();
+
+      if (sfKey) {
+        currentModel = 'Qwen/Qwen2.5-VL-72B-Instruct';
+        logger.info(`[Model Router] Text model '${rawModel}' lacks vision. Auto-switched to domestic SiliconFlow vision model '${currentModel}'.`);
+      } else if (dsKey) {
+        currentModel = 'qwen2.5-vl-72b-instruct';
+        logger.info(`[Model Router] Text model '${rawModel}' lacks vision. Auto-switched to DashScope vision model '${currentModel}'.`);
+      } else if (zpKey) {
+        currentModel = 'glm-4v-flash';
+        logger.info(`[Model Router] Text model '${rawModel}' lacks vision. Auto-switched to Zhipu vision model '${currentModel}'.`);
+      } else {
+        currentModel = CHAT_MODEL || 'gemini-2.5-flash';
+        logger.info(`[Model Router] Text model '${rawModel}' lacks vision. Falling back to '${currentModel}'.`);
+      }
+    }
+  }
+
+  // Fallback check: if request has image and the fallback model CANNOT see images, skip text-only fallback
+  const fallbackModel = process.env.DEEPSEEK_CHAT_MODEL || DEEPSEEK_CHAT_MODEL || 'deepseek-chat';
+  const fallbackCanSeeImage = isOpenAiVisionModel(fallbackModel);
+  const effectiveSkipDeepSeek = skipDeepSeek || (hasImage && !fallbackCanSeeImage);
+
+  const clientCustomKey = (options?.headers?.['x-gemini-api-key'] || options?.headers?.['X-Gemini-Api-Key'])?.trim();
+  if (clientCustomKey) {
+    invalidKeys.delete(clientCustomKey);
+    keyCooldown.delete(clientCustomKey);
+  }
+
+  const modifiedOptions = options;
+
+  // Strict per-request isolation: NEVER push clientCustomKey into the shared server API_KEYS pool
+  const validKeys = clientCustomKey ? [clientCustomKey] : API_KEYS.filter(k => !invalidKeys.has(k));
+
+  // Check if directly routing to domestic / OpenAI-compatible models (DeepSeek, Qwen-VL, GLM-4V, etc.)
+  const isOpenAiCompatible = currentModel.toLowerCase().includes('deepseek') ||
+                             currentModel.toLowerCase().includes('qwen') ||
+                             currentModel.toLowerCase().includes('glm') ||
+                             currentModel.toLowerCase().includes('step-') ||
+                             currentModel.startsWith('Qwen/') ||
+                             currentModel.startsWith('Pro/');
+  let url = buildURL(currentModel);
+  const urlType = url.includes('streamGenerateContent') ? 'stream' : (url.includes('embedContent') ? 'embed' : 'chat');
+
+  if (isOpenAiCompatible && (urlType === 'chat' || urlType === 'stream')) {
+    try {
+      return await fetchDeepSeek(urlType, options, currentModel);
+    } catch (dsErr) {
+      if (validKeys.length > 0) {
+        logger.warn(`[Gateway] ${currentModel} failed (${dsErr.message}). Automatically falling back to Gemini...`);
+        currentModel = CHAT_MODEL || 'gemini-2.5-flash';
+        url = buildURL(currentModel);
+      } else {
+        throw dsErr;
+      }
+    }
+  }
+
+  if (validKeys.length === 0) {
+    if ((urlType === 'chat' || urlType === 'stream') && !effectiveSkipDeepSeek) {
+      return await fetchDeepSeek(urlType, modifiedOptions);
+    }
+    throw new Error('EMBED_QUOTA_EXHAUSTED');
+  }
+
+  let lastError = null;
+  
+  // Security Fix: Added circuit breaker to prevent infinite loops when API is down
+  const loopLimit = Math.min(maxRetries, 6); 
+  let consecutiveErrors = 0;
+
+  for (let attempt = 0; attempt < loopLimit; attempt++) {
+    if (consecutiveErrors >= 3) {
+      logger.warn('[KeyPool] Circuit breaker triggered after 3 consecutive network/API failures.');
+      break;
+    }
+
+    if (modifiedOptions.signal && modifiedOptions.signal.aborted) {
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    }
+    let key = (attempt === 0 && clientCustomKey && !invalidKeys.has(clientCustomKey)) ? clientCustomKey : getNextKey();
+    if (invalidKeys.has(key) || (keyCooldown.get(key) && Date.now() <= keyCooldown.get(key))) {
+      key = null;
+      for (const candidate of validKeys) {
+        if (!invalidKeys.has(candidate)) {
+          const cooldownUntil = keyCooldown.get(candidate);
+          if (!cooldownUntil || Date.now() > cooldownUntil) {
+            key = candidate;
+            break;
+          }
+        }
+      }
+    }
+    if (!key) {
+      if ((urlType === 'chat' || urlType === 'stream') && !effectiveSkipDeepSeek) {
+        return await fetchDeepSeek(urlType, modifiedOptions);
+      }
+      // For embed requests, wait for the earliest cooldown to expire
+      const activeCooldowns = [...keyCooldown.entries()]
+        .filter(([k, expiry]) => validKeys.includes(k) && expiry && expiry > Date.now())
+        .map(([_, expiry]) => expiry);
+      
+      if (activeCooldowns.length > 0) {
+        const earliestExpiry = Math.min(...activeCooldowns);
+        const waitMs = earliestExpiry - Date.now();
+        if (waitMs > 0 && waitMs < 30000) {
+          logger.info(`[KeyPool] All keys in cooldown for embed request. Waiting ${waitMs}ms for nearest key...`);
+          await new Promise(r => setTimeout(r, waitMs));
+        }
+      }
+      // Try finding a key again after wait
+      for (const candidate of validKeys) {
+        if (!invalidKeys.has(candidate)) {
+          const cooldownUntil = keyCooldown.get(candidate);
+          if (!cooldownUntil || Date.now() > cooldownUntil) {
+            key = candidate;
+            break;
+          }
+        }
+      }
+      if (!key) {
+        key = validKeys[0];
+      }
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      try { controller.abort(); } catch (err) { logger.warn('Failed to abort controller on timeout:', err); }
+    }, timeoutMs);
+
+    const onExternalAbort = () => {
+      try { controller.abort(); } catch (err) { logger.warn('Failed to abort controller on external abort:', err); }
+    };
+
+    if (modifiedOptions.signal) {
+      if (modifiedOptions.signal.aborted) {
+        controller.abort();
+      } else {
+        modifiedOptions.signal.addEventListener('abort', onExternalAbort);
+      }
+    }
+
+    const cleanup = () => {
+      clearTimeout(timeoutId);
+      if (modifiedOptions.signal) {
+        modifiedOptions.signal.removeEventListener('abort', onExternalAbort);
+      }
+    };
+
+    try {
+      const fetchOptions = {
+        ...modifiedOptions,
+        headers: { ...(modifiedOptions.headers || {}), 'x-goog-api-key': key },
+        signal: controller.signal
+      };
+      if (proxyAgent) fetchOptions.dispatcher = proxyAgent;
+
+      const response = await undici.fetch(url, fetchOptions);
+      if (response.ok) {
+        cleanup();
+        consecutiveErrors = 0;
+        return response;
+      }
+
+      const body = await response.text();
+      cleanup();
+      lastError = new Error(`API error ${response.status}: ${body}`);
+
+      if (response.status === 404) {
+        if (urlType === 'embed' && currentModel !== 'gemini-embedding-001') {
+          logger.warn(`[KeyPool] Embed model '${currentModel}' not found (404), auto-fallback to 'gemini-embedding-001'...`);
+          currentModel = 'gemini-embedding-001';
+          url = buildURL(currentModel);
+          continue;
+        }
+        if (urlType !== 'embed' && currentModel !== 'gemini-2.5-flash' && !isOpenAiCompatible) {
+          logger.warn(`[KeyPool] Model '${currentModel}' not found (404), auto-fallback to 'gemini-2.5-flash'...`);
+          currentModel = 'gemini-2.5-flash';
+          url = buildURL(currentModel);
+          continue;
+        }
+        logger.error(`[KeyPool] Model not found (404) for model '${currentModel}'. Check model configuration.`);
+        throw new Error(`MODEL_NOT_FOUND: Model '${currentModel}' is not supported or not found.`);
+      }
+
+      if (response.status === 429 || response.status === 503) {
+        if (/quota/i.test(body)) {
+          if (urlType !== 'embed' && currentModel !== 'gemini-2.5-flash-lite' && !isOpenAiCompatible) {
+            logger.info(`[KeyPool] Model '${currentModel}' quota exhausted, auto-fallback to 'gemini-2.5-flash-lite'...`);
+            currentModel = 'gemini-2.5-flash-lite';
+            url = buildURL(currentModel);
+            continue;
+          }
+          keyCooldown.set(key, Date.now() + 60_000);
+          logger.warn(`[KeyPool] Key ${maskKey(key)} quota exhausted, cooling down.`);
+          continue;
+        }
+
+        // On 503 (high demand) or general 429: switch between gemini-2.5-flash and gemini-2.5-flash-lite
+        if (urlType !== 'embed' && !isOpenAiCompatible) {
+          const alternateModel = currentModel === 'gemini-2.5-flash' ? 'gemini-2.5-flash-lite' : 'gemini-2.5-flash';
+          logger.warn(`[KeyPool] Model '${currentModel}' returned ${response.status} (High demand/Throttled), auto-switching to alternate model '${alternateModel}'...`);
+          currentModel = alternateModel;
+          url = buildURL(currentModel);
+          keyCooldown.set(key, Date.now() + 5000);
+          await new Promise(resolve => setTimeout(resolve, 800));
+          continue;
+        }
+
+        logger.warn(`API ${response.status} on key ${maskKey(key)}, cooling down and retrying (Attempt ${attempt + 1}/${loopLimit}).`);
+        keyCooldown.set(key, Date.now() + 5000);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      } else {
+        // Only disable key if the error specifically points to invalid API key or permission denied
+        const isKeyAuthError = /API_KEY_INVALID|API key not valid|PERMISSION_DENIED|key.*invalid|CONSUMER_SUSPENDED/i.test(body);
+        if (isKeyAuthError) {
+          invalidKeys.add(key);
+          logger.error(`[KeyPool] Key ${maskKey(key)} returned critical key auth error ${response.status}. Key disabled.`);
+          continue;
+        } else {
+          logger.warn(`[KeyPool] API returned ${response.status} (${body.slice(0, 120)}), key remains valid.`);
+          break;
+        }
+      }
+    } catch (e) {
+      cleanup();
+      lastError = e;
+      consecutiveErrors++;
+      logger.warn(`Network error on key ${maskKey(key)}: ${e.message}, retrying... (Attempt ${attempt + 1}/${loopLimit}).`);
+      keyCooldown.set(key, Date.now() + 10_000);
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+  }
+
+  // All Gemini retries failed. If chat or stream, attempt DeepSeek fallback!
+  if ((urlType === 'chat' || urlType === 'stream') && !effectiveSkipDeepSeek) {
+    try {
+      return await fetchDeepSeek(urlType, modifiedOptions);
+    } catch (fallbackErr) {
+      logger.error(`[Gateway] Fallback DeepSeek failed as well: ${fallbackErr.message}`);
+      throw lastError || fallbackErr;
+    }
+  }
+
+  throw lastError || new Error('QUOTA_EXHAUSTED');
+}
+
+// Embedding Cache System (Issue 14)
+const EMBED_CACHE_MAX_SIZE = parseInt(process.env.EMBED_CACHE_MAX_SIZE || '1000', 10);
+const _embedCache = new Map();
+
+function getCachedEmbedding(text) {
+  const cleaned = String(text).trim().substring(0, 1500);
+  if (_embedCache.has(cleaned)) {
+    const val = _embedCache.get(cleaned);
+    _embedCache.delete(cleaned);
+    _embedCache.set(cleaned, val); // Move to end (most recently used)
+    return val;
+  }
+  return null;
+}
+
+function setCachedEmbedding(text, vector) {
+  if (!vector) return;
+  const cleaned = String(text).trim().substring(0, 1500);
+  
+  if (_embedCache.has(cleaned)) {
+    _embedCache.delete(cleaned);
+  } else if (_embedCache.size >= EMBED_CACHE_MAX_SIZE) {
+    const oldestKey = _embedCache.keys().next().value;
+    _embedCache.delete(oldestKey);
+  }
+  
+  _embedCache.set(cleaned, vector);
+}
+
+async function getEmbedding(text, clientHeaders = {}) {
+  const cleanedText = String(text).trim().substring(0, 1500);
+  if (!cleanedText) return null;
+
+  const cached = getCachedEmbedding(cleanedText);
+  if (cached) {
+    logger.info(`[EmbeddingCache] Hit for text: "${cleanedText.substring(0, 30)}..."`);
+    return cached;
+  }
+
+  try {
+    const response = await fetchWithKeyRotation(buildEmbedURL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(clientHeaders || {}) },
+      body: JSON.stringify({
+        model: `models/${EMBED_MODEL}`,
+        content: { parts: [{ text: cleanedText }] },
+        outputDimensionality: 768
+      })
+    });
+    const data = await response.json();
+    const vector = data.embedding?.values || null;
+    if (vector) {
+      setCachedEmbedding(cleanedText, vector);
+      logApiUsage(EMBED_MODEL, 'embed', cleanedText, 0, 'success');
+    } else {
+      logApiUsage(EMBED_MODEL, 'embed', cleanedText, 0, 'error');
+    }
+    return vector;
+  } catch (err) {
+    logApiUsage(EMBED_MODEL, 'embed', cleanedText, 0, 'error');
+    const msg = String(err?.message || '');
+    if (msg.includes('429') || /quota/i.test(msg) || msg.includes('QUOTA_EXHAUSTED')) {
+      const quotaErr = new Error('EMBED_QUOTA_EXHAUSTED');
+      quotaErr.code = 'EMBED_QUOTA_EXHAUSTED';
+      throw quotaErr;
+    }
+    throw err;
+  }
+}
+
+function unmarkInvalidKey(key) {
+  if (key) {
+    invalidKeys.delete(key);
+    keyCooldown.delete(key);
+  }
+}
+
+function resetKeyPool() {
+  invalidKeys.clear();
+  keyCooldown.clear();
+}
+
+module.exports = {
+  fetchWithKeyRotation,
+  getEmbedding,
+  buildChatURL,
+  buildStreamURL,
+  startEmbeddingCheck,
+  convertGeminiToDeepSeekPayload,
+  isOpenAiVisionModel,
+  unmarkInvalidKey,
+  resetKeyPool
+};

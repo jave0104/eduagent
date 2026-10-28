@@ -1,0 +1,101 @@
+name: Build & Release Android APK
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    name: Build ZengLian AI Tutor APK
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Install client dependencies and build web assets
+        run: |
+          cd client
+          npm install
+          VITE_API_URL=https://ai-tutor-79709693345.asia-east1.run.app npm run build
+          npx cap sync android
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x client/android/gradlew
+
+      - name: Build Android APK
+        run: |
+          cd client/android
+          ./gradlew assembleDebug --stacktrace
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: Prepare APK release artifact
+        run: |
+          cp client/android/app/build/outputs/apk/debug/app-debug.apk ./AI_Tutor_v1.6.1.apk
+          curl -sL https://github.com/Zenglian990/AI_Tutor_Release/releases/download/v1.6.0/AI_Tutor_v1.6.0.apk -o ./AI_Tutor_v1.6.0.apk || true
+          ls -lh ./AI_Tutor_v1*.apk
+
+      - name: Upload APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI_Tutor_v1.6.1
+          path: ./AI_Tutor_v1.6.1.apk
+          retention-days: 30
+
+      - name: Create or Update v1.6.1 Latest Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: v1.6.1
+          name: "曾练专属私教 v1.6.1 - 1-12年级小初高全科内置学习地图离线版 (高中全科图谱·高考高频押题·零延迟秒开)"
+          draft: false
+          prerelease: false
+          make_latest: true
+          body: |
+            ## 🚀 曾练专属私教 v1.6.1 (1-12年级小初高全学科·内置学习地图离线版)
+
+            - 🗺️ **内置全学段全学科课程章节地图（离线秒开·永不为空）**：
+              - 将人教版 1-12 年级（涵盖小学、初中、高中必修与选修各科）章节树全部离线固化至客户端；
+              - 彻底消除云端同步延迟与冷启动空状态，打开“闯关式学习地图”瞬间呈现完整章节关卡！
+            - 🎓 **1-12年级小初高全学段知识图谱完整贯通**：
+              - 全面覆盖人教版高中各科教材（高中语数英物化生政史地必修与选择性必修全科目）；
+              - 17,200+ 权威教材知识切片与向量检索图谱，深度赋能高中课标学习。
+            - 🎯 **高考高频押题与必考经典母题密卷**：
+              - 适配新高考全国卷（I/II卷）、北京卷、浙江卷等各省考情与分值题型架构（数学150分/物理100分/化学100分等）；
+              - 深度押题历年极高频经典母题模型（导数极值点偏移、圆锥曲线定点定值、双导轨微元感应、化工平衡常数Kp等）。
+            - 📝 **对标高考标准之步骤采分点智能评卷**：
+              - 贯彻高考阅卷采分点量规，按步骤采分赋予过程分；
+              - 严谨识别一题多解等价推导，针对失分陷阱提供避坑点拨。
+            - 📖 **全学段核心公式定理与题型模型宝典**：
+              - 新增高中数学空间向量/解析几何/导数积分、物理电磁力学/万有引力、化学反应原理等高频模型宝典。
+
+            ---
+            ### 🤖 安卓端下载与安装 (Android APK)：
+            1. 点击下方 Assets 列表中的 **`AI_Tutor_v1.6.1.apk`** 直接下载安装；
+            2. 安装后手机桌面将更新至 **【曾练专属私教 v1.6.1】**，点开即用！
+            *(按照规范，发布区严格保持最新的两个 APK 安装包: v1.6.1 与 v1.6.0)*
+          files: |
+            ./AI_Tutor_v1.6.1.apk
+            ./AI_Tutor_v1.6.0.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

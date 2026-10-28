@@ -1,0 +1,400 @@
+import React, { useState, useEffect } from 'react';
+import { formatGrade, authFetch, getApiUrl } from '../store/useStore';
+
+export default function WelcomeDashboard({
+  currentProfile,
+  selectedGrade,
+  selectedSubject,
+  onGradeChange,
+  onSubjectChange,
+  onPersonaChange,
+  onCameraClick,
+  onReviewMistakes,
+  onOpenMap,
+  onOpenTest,
+  onQuickPrompt,
+  onOpenRoadmap,
+  onOpenPrint,
+  onOpenParentMemo,
+  onOpenBatchGrade,
+  onOpenGamification,
+  onOpenManipulatives,
+  onOpenGeometrySandbox,
+  onOpenMentalMath,
+  onOpenFormulaHandbook
+}) {
+  const [briefing, setBriefing] = useState(null);
+  const [loadingBriefing, setLoadingBriefing] = useState(false);
+
+  const getGreeting = () => {
+    const hour = new Date().getHours();
+    if (hour < 12) return '早上好';
+    if (hour < 18) return '下午好';
+    return '晚上好';
+  };
+
+  const studentName = currentProfile?.name || '曾练';
+  const gradeLabel = formatGrade(selectedGrade);
+  const subjectLabel = selectedSubject || '数学';
+
+  // Fetch daily proactive briefing
+  useEffect(() => {
+    let isMounted = true;
+    async function fetchDailyBriefing() {
+      setLoadingBriefing(true);
+      try {
+        const url = `${getApiUrl()}/api/mentor/daily-briefing?profile_id=${encodeURIComponent(currentProfile?.id || 'default')}&grade=${encodeURIComponent(selectedGrade || '7_up')}&subject=${encodeURIComponent(selectedSubject || '数学')}&student_name=${encodeURIComponent(studentName)}`;
+        const res = await authFetch(url);
+        if (res.ok) {
+          const data = await res.json();
+          if (isMounted) setBriefing(data);
+        }
+      } catch (e) {
+        console.warn('Failed to load proactive briefing:', e);
+      } finally {
+        if (isMounted) setLoadingBriefing(false);
+      }
+    }
+    fetchDailyBriefing();
+    return () => { isMounted = false; };
+  }, [currentProfile?.id, selectedGrade, selectedSubject, studentName]);
+
+  // Determine stage category
+  const gradeStr = String(selectedGrade || '');
+  let stageName = '初中攻坚阶段';
+  let stageIcon = '📐';
+  let stageDescription = '四两拨千斤名师支架 · 题眼穿透 · 中考母题通关';
+
+  if (['10', '11', '12'].some(num => gradeStr.startsWith(num))) {
+    stageName = '高中冲刺与高考拔高';
+    stageIcon = '🎓';
+    stageDescription = '高考核心考点精讲 · 步骤采分点剖析 · 导数与圆锥曲线大题突破';
+  } else if (['1_', '2_', '3_'].some(n => gradeStr.startsWith(n)) || ['1', '2', '3'].includes(gradeStr)) {
+    stageName = '小学低段启蒙';
+    stageIcon = '🎈';
+    stageDescription = '情境化趣味探险 · 具象比喻 · 保护学习兴趣';
+  } else if (['4_', '5_', '6_'].some(n => gradeStr.startsWith(n)) || ['4', '5', '6'].includes(gradeStr)) {
+    stageName = '小学高段探究';
+    stageIcon = '📘';
+    stageDescription = '思维习惯养成 · 规律自主总结 · 循序渐进';
+  }
+
+  return (
+    <div className="welcome-dashboard">
+      {/* 1. Mentor Greeting & Proactive Briefing Hero Card */}
+      <div className="welcome-hero-card">
+        <div className="welcome-badge">
+          <span className="live-dot"></span>
+          <span>{briefing ? briefing.greetingHeadline : '专属名师已在案头备课完毕'}</span>
+        </div>
+        <h2 className="welcome-title">
+          {studentName}同学，{getGreeting()}！🎓
+        </h2>
+        <p className="welcome-subtitle">
+          当前辅导：<strong className="highlight-tag">{gradeLabel} · {subjectLabel}</strong>（人教版教材同步）
+        </p>
+
+        {/* Proactive Mentor Briefing Memo */}
+        {briefing?.suggestedMission && (
+          <div className="mentor-briefing-banner" style={{
+            background: 'linear-gradient(135deg, rgba(37, 99, 235, 0.1), rgba(147, 51, 234, 0.1))',
+            border: '1px solid rgba(59, 130, 246, 0.3)',
+            borderRadius: '12px',
+            padding: '12px 16px',
+            marginTop: '14px',
+            textAlign: 'left'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+              <span style={{ fontWeight: '600', color: '#2563eb', fontSize: '0.95rem' }}>
+                📋 今日专属突破任务：{briefing.suggestedMission.title}
+              </span>
+              <span style={{ fontSize: '0.8rem', background: '#3b82f6', color: '#fff', padding: '2px 8px', borderRadius: '10px' }}>
+                {briefing.dueMistakeCount > 0 ? `待复盘 ${briefing.dueMistakeCount} 题` : '新知识攻坚'}
+              </span>
+            </div>
+            <p style={{ margin: '4px 0 10px 0', fontSize: '0.88rem', color: '#475569', lineHeight: '1.4' }}>
+              💡 名师指引：{briefing.suggestedMission.reason}
+            </p>
+            <button
+              type="button"
+              className="briefing-action-btn"
+              onClick={() => onQuickPrompt(briefing.suggestedMission.query)}
+              style={{
+                background: '#2563eb',
+                color: '#fff',
+                border: 'none',
+                padding: '6px 14px',
+                borderRadius: '8px',
+                cursor: 'pointer',
+                fontWeight: '600',
+                fontSize: '0.85rem'
+              }}
+            >
+              🚀 {briefing.suggestedMission.actionLabel} →
+            </button>
+          </div>
+        )}
+
+        <div className="stage-feature-pill" style={{ marginTop: '12px' }}>
+          <span>{stageIcon}</span>
+          <span>{stageName}：{stageDescription}</span>
+        </div>
+      </div>
+
+
+      {/* 3. Primary Camera Action Card */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '14px', marginBottom: '20px' }}>
+        <div className="primary-camera-card" onClick={onCameraClick} role="button" tabIndex={0} onKeyDown={(e) => e.key === 'Enter' && onCameraClick()} style={{ margin: 0 }}>
+          <div className="camera-icon-wrapper">
+            <div className="camera-pulse-ring"></div>
+            <span className="camera-big-icon">📸</span>
+          </div>
+          <div className="camera-card-content">
+            <div className="camera-card-title">
+              <span>单题精讲 / 拍照问难题</span>
+              <span className="rec-badge">名师启发</span>
+            </div>
+            <div className="camera-card-desc">
+              卡在某一步推导？拍单题，私教一句话点破题眼套路，给草稿纸第一步动笔支架！
+            </div>
+          </div>
+          <div className="camera-card-arrow">
+            <span>拍照讲题</span>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 12h14M12 5l7 7-7 7"/>
+            </svg>
+          </div>
+        </div>
+
+        {onOpenBatchGrade && (
+          <div className="primary-camera-card" onClick={onOpenBatchGrade} role="button" tabIndex={0} onKeyDown={(e) => e.key === 'Enter' && onOpenBatchGrade()} style={{ margin: 0, borderColor: 'rgba(56, 189, 248, 0.5)', background: 'linear-gradient(135deg, rgba(2, 132, 199, 0.15), rgba(37, 99, 235, 0.08))' }}>
+            <div className="camera-icon-wrapper" style={{ background: 'linear-gradient(135deg, #0284c7, #2563eb)' }}>
+              <div className="camera-pulse-ring" style={{ borderColor: '#38bdf8' }}></div>
+              <span className="camera-big-icon">📑</span>
+            </div>
+            <div className="camera-card-content">
+              <div className="camera-card-title">
+                <span style={{ color: '#38bdf8' }}>整页作业 / 试卷秒级批改</span>
+                <span className="rec-badge" style={{ background: '#0284c7' }}>黑科技</span>
+              </div>
+              <div className="camera-card-desc">
+                晚上作业整页拍一张！自动识别卷面所有手写题、判断对错、错题一键归档错题本。
+              </div>
+            </div>
+            <div className="camera-card-arrow" style={{ color: '#38bdf8' }}>
+              <span>整页批改</span>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M5 12h14M12 5l7 7-7 7"/>
+              </svg>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 4. Action Cards Grid */}
+      <div className="welcome-action-grid">
+        <div className="action-card mist-card" onClick={onReviewMistakes} role="button" tabIndex={0}>
+          <div className="action-card-header">
+            <span className="action-card-icon">🔔</span>
+            <span className="action-card-name">错题靶向突围</span>
+          </div>
+          <p className="action-card-desc">调出易错知识点，针对性出变式题，当场拿下薄弱点</p>
+          <div className="action-card-cta">开始复测 →</div>
+        </div>
+
+        <div className="action-card map-card" onClick={onOpenMap} role="button" tabIndex={0}>
+          <div className="action-card-header">
+            <span className="action-card-icon">🗺️</span>
+            <span className="action-card-name">教材章节闯关</span>
+          </div>
+          <p className="action-card-desc">紧跟校内教材大纲，新知导读与核心概念层层通关</p>
+          <div className="action-card-cta">查看地图 →</div>
+        </div>
+
+        {/* 动态年级母题卡片 */}
+        {(() => {
+          let motherPrompt = `老师，请针对当前【${gradeLabel} · ${subjectLabel}】，为我精讲一个中考高频必考母题模型，一句话点破核心题眼，并出一道中考模拟题考考我！`;
+          let motherTitle = '经典母题点拨';
+          let motherDesc = '精选必考母题模型，掌握解题钥匙，举一反三';
+          let motherCta = '攻克母题 →';
+
+          if (['10', '11', '12'].some(n => gradeStr.startsWith(n))) {
+            motherPrompt = `老师，请针对当前【${gradeLabel} · ${subjectLabel}】，为我精析一个高考高频必考核心母题，详细点拨第一步动笔支架、步骤给分踩分点，并出一道高考试题变式题考考我！`;
+            motherTitle = '高考母题精析';
+            motherDesc = '高频必考题型精析，步骤采分点剖析，举一反三';
+            motherCta = '突破高考母题 →';
+          } else if (['1_', '2_', '3_'].some(n => gradeStr.startsWith(n)) || ['1', '2', '3'].includes(gradeStr)) {
+            motherPrompt = `老师，请针对当前【${gradeLabel} · ${subjectLabel}】，用生动有趣的比喻和日常生活小例子，为我讲透一个单元必会的基础核心题型，并出一道好玩的小闯关题考考我！`;
+            motherTitle = '趣味题型点拨';
+            motherDesc = '生动比喻通俗讲透，化身小侦探轻松闯关';
+            motherCta = '趣味闯关 →';
+          } else if (['4_', '5_', '6_'].some(n => gradeStr.startsWith(n)) || ['4', '5', '6'].includes(gradeStr)) {
+            motherPrompt = `老师，请针对当前【${gradeLabel} · ${subjectLabel}】，为我精讲一个期末高频考查的经典母题模型，引导我总结解题规律与草稿验算方法，并出一道微测题考考我！`;
+            motherTitle = '期末母题点拨';
+            motherDesc = '精选期末必考母题，梳理规律，举一反三';
+            motherCta = '掌握规律 →';
+          }
+
+          return (
+            <div
+              className="action-card exam-card"
+              onClick={() => onQuickPrompt(motherPrompt)}
+              role="button"
+              tabIndex={0}
+            >
+              <div className="action-card-header">
+                <span className="action-card-icon">💡</span>
+                <span className="action-card-name">{motherTitle}</span>
+              </div>
+              <p className="action-card-desc">{motherDesc}</p>
+              <div className="action-card-cta">{motherCta}</div>
+            </div>
+          );
+        })()}
+
+        {onOpenTest && (() => {
+          let examTitle = '名校中考模考';
+          let examDesc = '中考真题规格沉浸式倒计时，名师步骤赋分与压轴题剖析';
+          let examCta = '进入中考考场 →';
+
+          if (['10', '11', '12'].some(n => gradeStr.startsWith(n))) {
+            examTitle = '高考全真模考';
+            examDesc = '高考全国卷全真试题规格，沉浸式倒计时与规范解题步骤给分';
+            examCta = '进入高考考场 →';
+          } else if (['1_', '2_', '3_'].some(n => gradeStr.startsWith(n)) || ['1', '2', '3'].includes(gradeStr)) {
+            examTitle = '单元模拟闯关';
+            examDesc = '课本单元随堂小测，生动评分与趣味名师讲解';
+            examCta = '开始小测 →';
+          } else if (['4_', '5_', '6_'].some(n => gradeStr.startsWith(n)) || ['4', '5', '6'].includes(gradeStr)) {
+            examTitle = '名校期末模考';
+            examDesc = '名校期末全真试卷规格，沉浸式倒计时与规范解题给分';
+            examCta = '进入期末考场 →';
+          }
+
+          return (
+            <div className="action-card" onClick={onOpenTest} role="button" tabIndex={0} style={{ borderColor: 'rgba(236, 72, 153, 0.4)', background: 'linear-gradient(135deg, rgba(236, 72, 153, 0.12), rgba(219, 39, 119, 0.05))' }}>
+              <div className="action-card-header">
+                <span className="action-card-icon">🏛️</span>
+                <span className="action-card-name" style={{ color: '#ec4899' }}>{examTitle}</span>
+              </div>
+              <p className="action-card-desc">{examDesc}</p>
+              <div className="action-card-cta" style={{ color: '#ec4899' }}>{examCta}</div>
+            </div>
+          );
+        })()}
+
+        {onOpenManipulatives && (['1_', '2_', '3_'].some(n => gradeStr.startsWith(n)) || ['1', '2', '3'].includes(gradeStr)) && (
+          <div className="action-card" onClick={onOpenManipulatives} role="button" tabIndex={0} style={{ borderColor: 'rgba(245, 158, 11, 0.4)', background: 'linear-gradient(135deg, rgba(245, 158, 11, 0.12), rgba(234, 88, 12, 0.05))' }}>
+            <div className="action-card-header">
+              <span className="action-card-icon">🎒</span>
+              <span className="action-card-name" style={{ color: '#f59e0b' }}>小学趣味实物教具</span>
+            </div>
+            <p className="action-card-desc">十进制积木、苹果糖果均分与等式守恒天平动手启发</p>
+            <div className="action-card-cta" style={{ color: '#f59e0b' }}>动手摆一摆 →</div>
+          </div>
+        )}
+
+        {onOpenGeometrySandbox && (['7_', '8_', '9_'].some(n => gradeStr.startsWith(n)) || ['7', '8', '9'].includes(gradeStr)) && (
+          <div className="action-card" onClick={onOpenGeometrySandbox} role="button" tabIndex={0} style={{ borderColor: 'rgba(37, 99, 235, 0.4)', background: 'linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(29, 78, 216, 0.05))' }}>
+            <div className="action-card-header">
+              <span className="action-card-icon">📐</span>
+              <span className="action-card-name" style={{ color: '#60a5fa' }}>动点压轴几何沙盒</span>
+            </div>
+            <p className="action-card-desc">中考动点轨迹动态推演，二次函数系数滑杆直观击穿难点</p>
+            <div className="action-card-cta" style={{ color: '#60a5fa' }}>推演动点 →</div>
+          </div>
+        )}
+
+        {/* 🎯 高考高频押题密卷 (高中阶段特化) vs ⚡ 60秒趣味口算天天练 (小初阶段) */}
+        {['10', '11', '12'].includes(String(selectedGrade).split('_')[0]) && onOpenTest ? (
+          <div className="action-card" onClick={onOpenTest} role="button" tabIndex={0} style={{ borderColor: 'rgba(239, 68, 68, 0.4)', background: 'linear-gradient(135deg, rgba(239, 68, 68, 0.15), rgba(220, 38, 38, 0.05))' }}>
+            <div className="action-card-header">
+              <span className="action-card-icon">🎯</span>
+              <span className="action-card-name" style={{ color: '#f87171' }}>高考高频押题密卷</span>
+            </div>
+            <p className="action-card-desc">历年高考高频母题与核心题眼精准提炼，全真高考步骤采分点评分</p>
+            <div className="action-card-cta" style={{ color: '#f87171' }}>开考押题卷 →</div>
+          </div>
+        ) : onOpenMentalMath ? (
+          <div className="action-card" onClick={onOpenMentalMath} role="button" tabIndex={0} style={{ borderColor: 'rgba(56, 189, 248, 0.4)', background: 'linear-gradient(135deg, rgba(56, 189, 248, 0.12), rgba(16, 185, 129, 0.05))' }}>
+            <div className="action-card-header">
+              <span className="action-card-icon">⚡</span>
+              <span className="action-card-name" style={{ color: '#38bdf8' }}>60秒趣味口算天天练</span>
+            </div>
+            <p className="action-card-desc">1-9年级自适应速算冲刺，移动端九宫格大键盘，连对暴击获EXP</p>
+            <div className="action-card-cta" style={{ color: '#38bdf8' }}>口算冲刺 →</div>
+          </div>
+        ) : null}
+
+        {/* 📖 中考数理化必备公式定理速查宝典 */}
+        {onOpenFormulaHandbook && (
+          <div className="action-card" onClick={onOpenFormulaHandbook} role="button" tabIndex={0} style={{ borderColor: 'rgba(168, 85, 247, 0.4)', background: 'linear-gradient(135deg, rgba(168, 85, 247, 0.12), rgba(139, 92, 246, 0.05))' }}>
+            <div className="action-card-header">
+              <span className="action-card-icon">📖</span>
+              <span className="action-card-name" style={{ color: '#c084fc' }}>数理化公式定理宝典</span>
+            </div>
+            <p className="action-card-desc">{['10', '11', '12'].includes(String(selectedGrade).split('_')[0]) ? '导数圆锥曲线、万有引力动量电磁、平衡Kp与电化学离线速查' : '代数几何、物理力电浮力、化学口诀离线秒查，一键复制提问'}</p>
+            <div className="action-card-cta" style={{ color: '#c084fc' }}>速查宝典 →</div>
+          </div>
+        )}
+
+        {/* 6. Macro Roadmap & Paper-Screen Loop Super Cards */}
+        {onOpenGamification && (
+          <div className="action-card" onClick={onOpenGamification} role="button" tabIndex={0} style={{ borderColor: 'rgba(234, 179, 8, 0.4)', background: 'linear-gradient(135deg, rgba(234, 179, 8, 0.12), rgba(245, 158, 11, 0.05))' }}>
+            <div className="action-card-header">
+              <span className="action-card-icon">👑</span>
+              <span className="action-card-name" style={{ color: '#facc15' }}>学霸段位与勋章墙</span>
+            </div>
+            <p className="action-card-desc">多巴胺成长驱动：连胜天数、费曼反讲勋章与数理院士之路</p>
+            <div className="action-card-cta" style={{ color: '#facc15' }}>查看段位勋章 →</div>
+          </div>
+        )}
+
+        {onOpenRoadmap && (
+          <div className="action-card" onClick={onOpenRoadmap} role="button" tabIndex={0} style={{ borderColor: 'rgba(56, 189, 248, 0.4)' }}>
+            <div className="action-card-header">
+              <span className="action-card-icon">🏛️</span>
+              <span className="action-card-name" style={{ color: '#38bdf8' }}>长周期战役沙盘</span>
+            </div>
+            <p className="action-card-desc">全局把控中考/期末提分节奏，锁定阶段里程碑核心分</p>
+            <div className="action-card-cta" style={{ color: '#38bdf8' }}>查看看板 →</div>
+          </div>
+        )}
+
+        {onOpenPrint && (
+          <div className="action-card" onClick={onOpenPrint} role="button" tabIndex={0} style={{ borderColor: 'rgba(16, 185, 129, 0.4)' }}>
+            <div className="action-card-header">
+              <span className="action-card-icon">🖨️</span>
+              <span className="action-card-name" style={{ color: '#34d399' }}>A4 纸质试卷打印</span>
+            </div>
+            <p className="action-card-desc">脱离屏幕保护视力，一键排版高清错题卷，回传秒批</p>
+            <div className="action-card-cta" style={{ color: '#34d399' }}>打印试卷 →</div>
+          </div>
+        )}
+
+        {onOpenParentMemo && (
+          <div className="action-card" onClick={onOpenParentMemo} role="button" tabIndex={0} style={{ borderColor: 'rgba(245, 158, 11, 0.4)' }}>
+            <div className="action-card-header">
+              <span className="action-card-icon">💌</span>
+              <span className="action-card-name" style={{ color: '#fbbf24' }}>名师家访便签</span>
+            </div>
+            <p className="action-card-desc">真动脑时长与考点攻克一目了然，家长放心掌上掌控</p>
+            <div className="action-card-cta" style={{ color: '#fbbf24' }}>查看便签 →</div>
+          </div>
+        )}
+      </div>
+
+      {/* 5. Mastery & Encouragement Footer */}
+      <div className="welcome-footer-banner">
+        <div className="footer-tip-item">
+          <span>🎯</span>
+          <span><strong>苏格拉底分步启发</strong>：不直接甩全解，单步设问闯关，答对一步再解锁下一步。</span>
+        </div>
+        <div className="footer-tip-item">
+          <span>🔄</span>
+          <span><strong>费曼角色互换</strong>：攻克难题后，私教主动请你用一句话把解题玄机讲给老师听！</span>
+        </div>
+      </div>
+    </div>
+  );
+}
